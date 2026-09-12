@@ -13,7 +13,7 @@ from aiohttp import (
     ServerDisconnectedError,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
@@ -83,6 +83,45 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
 
     return True
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up Nest Protect services."""
+
+    async def async_update_auth(call: ServiceCall) -> None:
+        """Update Nest Protect authentication credentials."""
+        issue_token = call.data["issue_token"]
+        cookies = call.data["cookies"]
+
+        entries = hass.config_entries.async_entries(DOMAIN)
+
+        if not entries:
+            LOGGER.error("No Nest Protect config entry found")
+            return
+
+        entry = entries[0]
+
+        LOGGER.info("Updating Nest Protect authentication credentials")
+
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_ISSUE_TOKEN: issue_token,
+                CONF_COOKIES: cookies,
+            },
+        )
+
+        await hass.config_entries.async_reload(entry.entry_id)
+
+        LOGGER.info("Nest Protect authentication updated and integration reloaded")
+
+    if not hass.services.has_service(DOMAIN, "update_auth"):
+        hass.services.async_register(
+            DOMAIN,
+            "update_auth",
+            async_update_auth,
+        )
+
+    return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Nest Protect from a config entry."""
