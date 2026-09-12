@@ -14,7 +14,12 @@ from aiohttp import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -87,32 +92,115 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up Nest Protect services."""
 
     async def async_update_auth(call: ServiceCall) -> None:
-        """Update Nest Protect authentication credentials."""
-        issue_token = call.data["issue_token"]
-        cookies = call.data["cookies"]
+        """Validate and update Nest Protect authentication credentials."""
+        issue_token = call.data["issue_token"].strip()
+        cookies = call.data["cookies"].strip()
 
         entries = hass.config_entries.async_entries(DOMAIN)
 
         if not entries:
             LOGGER.error("No Nest Protect config entry found")
-            return
+            raise HomeAssistantError("No Nest Protect config entry found")
 
         entry = entries[0]
 
-        LOGGER.info("Updating Nest Protect authentication credentials")
+        # Reject obviously malformed input before contacting Google/Nest.
+        if not issue_token.startswith(
+            "https://accounts.google.com/o/oauth2/iframerpc"
+        ):
+            LOGGER.error("Rejected Nest Protect auth update: invalid issue token URL")
+            raise ServiceValidationError("Invalid Nest issue token URL")
 
+        if "action=issueToken" not in issue_token:
+            LOGGER.error("Rejected Nest Protect auth update: invalid issue token")
+            raise ServiceValidationError("Invalid Nest issue token")
+
+        if len(cookies) <= 100 or "=" not in cookies:
+            LOGGER.error("Rejected Nest Protect auth update: invalid cookies")
+            raise ServiceValidationError("Invalid Google authentication cookies")
+
+        LOGGER.info("Validating new Nest Protect authentication credentials")
+
+        account_type = entry.data.get(
+            CONF_ACCOUNT_TYPE,
+            Environment.PRODUCTION,
+        )
+        session = async_create_clientsession(hass)
+        client = NestClient(
+            session=session,
+            environment=NEST_ENVIRONMENTS[account_type],
+        )
+
+        try:
+            # Confirm Google accepts the fresh cookies.
+            auth = await client.get_access_token_from_cookies(
+                issue_token,
+                cookies,
+            )
+
+            # Confirm Nest accepts Google's access token.
+            nest = await client.authenticate(auth.access_token)
+
+            # Confirm real Nest account/device data can be retrieved.
+            await client.get_first_data(
+                nest.access_token,
+                nest.userid,
+            )
+
+        except BadCredentialsException as exception:
+            LOGGER.error(
+                "Rejected Nest Protect auth update: credentials refused: %s",
+                exception,
+            )
+            raise HomeAssistantError(
+                "Nest authentication credentials were rejected"
+            ) from exception
+
+        except (TimeoutError, ClientError) as exception:
+            LOGGER.error(
+                "Nest Protect auth validation could not contact Google/Nest: %s",
+                exception,
+            )
+            raise HomeAssistantError(
+                "Could not validate Nest authentication"
+            ) from exception
+
+        except Exception as exception:  # pylint: disable=broad-except
+            LOGGER.exception(
+                "Unexpected Nest Protect authentication validation failure"
+            )
+            raise HomeAssistantError(
+                "Nest authentication validation failed"
+            ) from exception
+
+        # Google may rotate cookies during validation.
+        validated_cookies = client.refreshed_cookies or cookies
+
+        LOGGER.info("Nest Protect authentication validated successfully")
+
+        # Only save credentials after they have actually worked.
         hass.config_entries.async_update_entry(
             entry,
             data={
                 **entry.data,
                 CONF_ISSUE_TOKEN: issue_token,
-                CONF_COOKIES: cookies,
+                CONF_COOKIES: validated_cookies,
             },
         )
 
-        await hass.config_entries.async_reload(entry.entry_id)
+        reload_ok = await hass.config_entries.async_reload(entry.entry_id)
 
-        LOGGER.info("Nest Protect authentication updated and integration reloaded")
+        if not reload_ok:
+            LOGGER.error(
+                "Nest Protect credentials validated but integration reload failed"
+            )
+            raise HomeAssistantError(
+                "Nest Protect integration reload failed"
+            )
+
+        LOGGER.info(
+            "Nest Protect authentication updated and integration reloaded"
+        )
 
     if not hass.services.has_service(DOMAIN, "update_auth"):
         hass.services.async_register(
@@ -122,6 +210,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         )
 
     return True
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Nest Protect from a config entry."""
